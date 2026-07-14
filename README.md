@@ -1,10 +1,8 @@
 # housing-analysis
 
-**Did COVID-19 drive a suburban housing boom?**
+**Did COVID-19 Drive a Suburban Housing Boom?**
 
 A difference-in-differences analysis of whether the COVID-19-era shift toward remote work caused suburban county housing prices to rise faster than urban core county housing prices.
-
-Authors: Krish Prasad, Brandon Melendez-Rodriguez, Arjun Johal, Julian Garcia
 
 ## Research question
 
@@ -19,14 +17,14 @@ The two datasets are merged on 5-digit county FIPS codes. Large Central Metro co
 
 ## Method
 
-Difference-in-differences design:
+Difference-in-differences Design:
 
 - **Sample:** 2010–2024, restricted to urban core and suburban counties, balanced panel (each county must have all 15 annual observations).
 - **Outcome:** winsorized year-over-year HPI growth rate (`chg_w`), not raw HPI levels, since FHFA's index is anchored to county-specific base years and isn't comparable across counties.
 - **Treatment indicator:** `did_term = suburban x post_covid`, where `post_covid = 1` for years ≥ 2020.
 - **Identifying assumption:** parallel trends between suburban and urban core growth rates absent COVID-19, assessed visually pre-2020.
 
-## Repo contents
+## Repo Contents
 
 | File | Description |
 |---|---|
