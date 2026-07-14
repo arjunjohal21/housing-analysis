@@ -30,7 +30,23 @@ Difference-in-differences Design:
 |---|---|
 | [housing_analysis.Rmd](housing_analysis.Rmd) | Full write-up: data description, sample construction, DiD analysis, and robustness checks (R Markdown) |
 | [housing_analysis.pdf](housing_analysis.pdf) | Rendered PDF of the analysis |
-| [slides.qmd](slides.qmd) | Presentation deck summarizing the question, method, findings, and recommendation (Quarto) |
+| [slides.qmd](slides.qmd) | Presentation deck source: question, method, findings, and recommendation (Quarto revealjs) |
+| [slides.html](slides.html) | Rendered slide deck |
+
+## Viewing the slides
+
+`slides.html` is a self-contained [reveal.js](https://revealjs.com/) deck. GitHub won't render HTML inline, so view it one of these ways:
+
+- **Download and open locally:** click `slides.html` in the file list → "Download raw file" → open it in a browser. Arrow keys advance slides.
+- **Clone and open:**
+  ```bash
+  git clone https://github.com/arjunjohal21/housing-analysis.git
+  open housing-analysis/slides.html   # macOS; use xdg-open on Linux, start on Windows
+  ```
+- **Re-render from source:**
+  ```bash
+  quarto preview slides.qmd
+  ```
 
 ## Reproducing
 
