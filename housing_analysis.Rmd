@@ -1,0 +1,524 @@
+---
+title: "Plan of Attack: COVID-19 and Suburban Housing Prices"
+subtitle: "FHFA House Price Index × CDC NCHS Urban-Rural Classification"
+author: "Krish Prasad, Brandon Melendez-Rodriguez, Arjun Johal, Julian Garcia"
+date: "May 13, 2026"
+output:
+  pdf_document:
+    toc: false
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4
+)
+library(tidyverse)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+
+*This continues the FHFA / CDC NCHS example from the Question and Dataset assignment.*
+
+**Research question:** Did the COVID-19 shift toward remote work lead to a relative increase in housing prices in suburban counties compared to urban core counties?
+
+---
+
+# Section 1: Raw Data Description
+
+```{r load-data}
+fhfa_tmp <- tempfile(fileext = ".xlsx")
+download.file(
+  "https://www.dropbox.com/scl/fi/yv9tmp3qy1ptsf14mnva9/hpi_at_county.xlsx?rlkey=k5cofuu4727e7meyrar03a7bs&st=b5350pg8&dl=1",
+  destfile = fhfa_tmp,
+  mode = "wb"
+)
+
+fhfa <- readxl::read_excel(fhfa_tmp, skip = 5) %>%
+  rename(
+    fips = `FIPS code`,
+    annual_chg_pct = `Annual Change (%)`
+  ) %>%
+  select(State, County, fips, Year, annual_chg_pct, HPI) %>%
+  filter(!is.na(fips), !is.na(Year), !is.na(HPI))
+
+nchs <- read.csv(
+  "https://www.dropbox.com/scl/fi/7q954iclej4h1ul8ws4mx/NCHSurb-rural-codes-1.csv?rlkey=jt3328zij53gh1meygvdc3627&st=yqumzfjf&dl=1"
+) %>%
+  select(STFIPS, CTYFIPS, ST_ABBREV, CTYNAME, CODE2023) %>%
+  mutate(fips = STFIPS * 1000 + CTYFIPS)
+
+df <- fhfa %>%
+  inner_join(nchs, by = "fips") %>%
+  mutate(
+    suburban = as.integer(CODE2023 == 2),
+    post_covid = as.integer(Year >= 2020),
+    did_term = suburban * post_covid,
+    county_type = case_when(
+      CODE2023 == 1 ~ "Urban Core (Large Central Metro)",
+      CODE2023 == 2 ~ "Suburban (Large Fringe Metro)",
+      CODE2023 == 3 ~ "Medium Metro",
+      CODE2023 == 4 ~ "Small Metro",
+      CODE2023 == 5 ~ "Micropolitan",
+      CODE2023 == 6 ~ "Non-core"
+    )
+  )
+```
+
+**Dataset 1 — FHFA House Price Index.** The FHFA House Price Index is a county-level annual panel dataset produced by the Federal Housing Finance Agency. It contains `r format(nrow(fhfa), big.mark = ",")` observations spanning `r min(fhfa$Year, na.rm = TRUE)` to `r max(fhfa$Year, na.rm = TRUE)`, covering `r n_distinct(fhfa$fips, na.rm = TRUE)` unique county FIPS codes. Each observation is uniquely identified by a (county FIPS, year) pair; each row represents one county in one calendar year. The key variable is `HPI`, a repeat-transactions price index anchored to a county-specific reference year. The dataset also reports `Annual Change (%)`, the year-over-year HPI growth rate. An important feature is that the panel is **unbalanced**: not all counties have observations in every year, which motivates the balanced-panel restriction in Section 2.
+
+**Dataset 2 — CDC NCHS Urban-Rural Classification.** The CDC National Center for Health Statistics Urban-Rural Classification Scheme assigns a single code (`CODE2023`) to each of `r nrow(nchs)` U.S. counties. The classification is a 6-level ordered scale ranging from 1 (Large Central Metro, most urban) to 6 (Non-core, most rural). This dataset has **one row per county** and carries no time dimension — it is a static cross-sectional file merged onto the FHFA panel. In our difference-in-differences design, `CODE2023 == 1` counties serve as the **urban core control group** and `CODE2023 == 2` (Large Fringe Metro) counties as the **suburban treatment group**.
+
+**Merged dataset.** The two datasets are joined using FIPS codes. The NCHS file stores state FIPS (`STFIPS`) and county FIPS (`CTYFIPS`) separately, so we compute `fips = STFIPS x 1000 + CTYFIPS` to match FHFA's 5-digit format. An inner join retains only counties present in both datasets; as shown in Section 2, this removes zero observations. The merged panel contains `r format(nrow(df), big.mark = ",")` county-year observations across `r n_distinct(df$fips)` unique counties and `r ncol(df)` variables. Key fields are:
+
+```{r field-table}
+fields <- tibble(
+  Field = c(
+    "HPI",
+    "annual_chg_pct",
+    "Year",
+    "State",
+    "County",
+    "fips",
+    "CODE2023",
+    "suburban",
+    "post_covid"
+  ),
+  Description = c(
+    "House Price Index — primary outcome (repeat-transactions index, county-specific base year = 100)",
+    "Year-over-year HPI growth rate (%)",
+    "Calendar year of the observation",
+    "U.S. state abbreviation",
+    "County name",
+    "5-digit county FIPS code (merge key across both datasets)",
+    "CDC NCHS urban-rural code: 1 = Large Central Metro ... 6 = Non-core",
+    "1 if Large Fringe Metro (suburban treatment group), 0 if Large Central Metro",
+    "1 if Year >= 2020 (post-COVID period), 0 otherwise"
+  )
+)
+kable(
+  fields,
+  booktabs = TRUE,
+  align = "ll",
+  caption = "Key fields in the merged FHFA-NCHS dataset"
+) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down")) %>%
+  column_spec(2, width = "10cm")
+```
+
+Our primary dependent variable is `HPI`; for all comparisons across counties we use `annual_chg_pct` (and a winsorized version, `chg_w`, constructed in Section 2) because raw HPI levels are anchored to county-specific base years and are not comparable cross-sectionally. Our key independent variables are `suburban`, `post_covid`, and their interaction `did_term = suburban x post_covid` — the difference-in-differences term. Summary statistics for the key variables appear in the table below.
+
+```{r summary-table}
+make_row <- function(data, col, label) {
+  x <- data[[col]]
+  x <- x[!is.na(x)]
+  tibble(
+    Variable = label,
+    Mean = round(mean(x), 2),
+    SD = round(sd(x), 2),
+    Min = round(min(x), 2),
+    Median = round(median(x), 2),
+    Max = round(max(x), 2)
+  )
+}
+
+sum_tbl <- bind_rows(
+  make_row(df, "HPI", "  HPI (index)"),
+  make_row(df, "annual_chg_pct", "  Annual HPI change (%)"),
+  make_row(df, "suburban", "  suburban (0/1)"),
+  make_row(df, "post_covid", "  post_covid (0/1)"),
+  make_row(df, "did_term", "  suburban x post_covid (0/1)")
+)
+
+kable(
+  sum_tbl,
+  booktabs = TRUE,
+  align = "lrrrrr",
+  caption = paste0(
+    "Summary statistics, full merged panel (",
+    format(nrow(df), big.mark = ","),
+    " county-year observations, ",
+    min(df$Year),
+    "--",
+    max(df$Year),
+    ")"
+  )
+) %>%
+  kable_styling(latex_options = "hold_position") %>%
+  pack_rows(
+    "Dependent / outcome variables",
+    1,
+    2,
+    italic = TRUE,
+    bold = FALSE
+  ) %>%
+  pack_rows(
+    "Treatment indicators (constructed)",
+    3,
+    5,
+    italic = TRUE,
+    bold = FALSE
+  )
+```
+
+The histogram below visualizes the distribution of `HPI` across all county-year observations in the merged panel. The right-skewed shape --- with most counties between 100 and 300 but a long tail of high-value coastal metros --- is one reason to use annual growth rates rather than raw HPI levels as the DiD outcome: a county with HPI = 300 is not necessarily more expensive today than one with HPI = 150; it may simply have an older base year.
+
+```{r hpi-histogram, fig.height = 3.5, fig.cap = "Distribution of HPI across all county-year observations in the full merged panel. Right skew is driven by a small number of high-value coastal counties. Dashed line marks the sample median. This distribution motivates using annual growth rates as the DiD outcome rather than raw levels."}
+hpi_med <- median(df$HPI, na.rm = TRUE)
+ggplot(df %>% filter(!is.na(HPI)), aes(x = HPI)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white", alpha = 0.85) +
+  geom_vline(
+    xintercept = hpi_med,
+    linetype = "dashed",
+    color = "firebrick",
+    linewidth = 0.9
+  ) +
+  annotate(
+    "text",
+    x = hpi_med + 15,
+    y = Inf,
+    label = paste0("Median = ", round(hpi_med, 0)),
+    hjust = 0,
+    vjust = 1.5,
+    size = 3.2,
+    color = "firebrick"
+  ) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(
+    x = "House Price Index (HPI)",
+    y = "County-year observations",
+    title = "Distribution of HPI -- Full Merged Panel"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+The line chart below plots mean HPI over time for each of the six urban-rural codes, using the full unfiltered panel. It establishes the baseline time behavior of the dependent variable and shows that Large Central Metro (Code 1) and Large Fringe Metro (Code 2) counties --- the DiD control and treatment groups --- carry the highest HPI levels and the steepest post-2020 appreciation.
+
+```{r raw-hpi-trends, fig.height = 4, fig.cap = "Mean HPI by year for all 6 CDC NCHS urban-rural classification codes (unfiltered merged panel). Dashed line marks 2020. The two highest lines are the DiD treatment and control groups (Codes 1 and 2). Sanity-check the raw series before running the DiD."}
+df %>%
+  filter(Year >= 2005, !is.na(county_type)) %>%
+  group_by(Year, county_type) %>%
+  summarise(mean_HPI = mean(HPI, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(
+    x = Year,
+    y = mean_HPI,
+    color = county_type,
+    group = county_type
+  )) +
+  geom_line(linewidth = 1.0) +
+  geom_vline(xintercept = 2020, linetype = "dashed", color = "grey40") +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(breaks = seq(2006, 2024, 2)) +
+  labs(
+    x = "Year",
+    y = "Mean House Price Index (HPI)",
+    color = "County Type",
+    title = "Raw HPI Trends by Urban-Rural Classification"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 7.5),
+    legend.key.size = unit(0.5, "cm")
+  )
+```
+
+Immediate data quality issues: (1) the panel is unbalanced --- not all counties report HPI in every year, which we address in Section 2 by requiring a balanced panel; (2) `HPI` carries county-specific base years, so raw levels are not comparable across counties --- we use growth rates as the main outcome; (3) `annual_chg_pct` contains extreme values (range: `r round(min(df$annual_chg_pct, na.rm = TRUE), 1)`% to `r round(max(df$annual_chg_pct, na.rm = TRUE), 1)`%) driven by counties with very few data points or administrative reclassifications; (4) `CODE2023` reflects 2023 boundaries and may not perfectly capture urban-rural status in earlier decades for counties near classification boundaries.
+
+**Contingencies.** If growth rate histograms confirm extreme outliers, we will winsorize `annual_chg_pct` at the 1st and 99th percentiles and use the resulting `chg_w` as the main outcome in all DiD figures, reporting both raw and winsorized estimates as a robustness check. For the extra-credit regression check (Check 4), we use `log(HPI)` with county and year fixed effects, which eliminates base-year differences by conditioning within counties.
+
+---
+
+# Section 2: Sample Construction Plan
+
+```{r sample-construction}
+n_raw_fhfa <- nrow(fhfa)
+n_after_join <- nrow(df)
+
+step_year <- df %>% filter(Year >= 2010, Year <= 2024)
+n_after_year <- nrow(step_year)
+
+step_code <- step_year %>% filter(CODE2023 %in% c(1, 2))
+n_after_code <- nrow(step_code)
+
+step_bal <- step_code %>%
+  group_by(fips) %>%
+  filter(n() == 15) %>%
+  ungroup()
+n_after_bal <- nrow(step_bal)
+
+df_clean <- step_bal
+
+filter_tbl <- tibble(
+  Step = 1:5,
+  `Filter` = c(
+    "Raw FHFA HPI observations (no restrictions)",
+    "Inner join with CDC NCHS on 5-digit FIPS code",
+    "Restrict to analytic window: 2010-2024",
+    "Keep Large Central Metro (Code 1) and Large Fringe Metro (Code 2) only",
+    "Require all 15 annual observations per county (balanced panel)"
+  ),
+  `Obs. Remaining` = format(
+    c(n_raw_fhfa, n_after_join, n_after_year, n_after_code, n_after_bal),
+    big.mark = ","
+  ),
+  `Obs. Removed` = format(
+    c(
+      0,
+      n_raw_fhfa - n_after_join,
+      n_after_join - n_after_year,
+      n_after_year - n_after_code,
+      n_after_code - n_after_bal
+    ),
+    big.mark = ","
+  )
+)
+
+kable(
+  filter_tbl,
+  booktabs = TRUE,
+  align = "clrr",
+  caption = "Sample construction: observations remaining and removed at each step"
+) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down")) %>%
+  column_spec(2, width = "9cm") %>%
+  row_spec(5, bold = TRUE)
+```
+
+```{r dep-var-construct, include = FALSE}
+df_clean <- df_clean %>%
+  mutate(
+    log_HPI = log(HPI),
+    p01 = quantile(annual_chg_pct, 0.01, na.rm = TRUE),
+    p99 = quantile(annual_chg_pct, 0.99, na.rm = TRUE),
+    chg_w = pmax(pmin(annual_chg_pct, p99), p01)
+  ) %>%
+  select(-p01, -p99)
+
+n_counties <- n_distinct(df_clean$fips)
+n_suburban <- n_distinct(df_clean$fips[df_clean$suburban == 1])
+n_urban <- n_distinct(df_clean$fips[df_clean$suburban == 0])
+n_obs <- nrow(df_clean)
+```
+
+1. **Sample window: 2010 to 2024, inclusive.** We restrict to `r n_distinct(df_clean$Year)` years spanning 2010--2024. Starting in 2010 avoids conflating the COVID-19 shock with the structural break of the 2008--2009 financial crisis and its multi-year recovery. A 10-year pre-period (2010--2019) is ample for visual parallel-trends assessment in Figure 3, and the window ends at the latest available data year. *Why:* The 2008 financial crisis depressed urban core and suburban markets differently and at different speeds; including those years would introduce a confounding pre-treatment divergence that has nothing to do with remote work. This filter removes `r format(n_after_join - n_after_year, big.mark = ",")` observations from the merged panel.
+
+2. **Sample restrictions.** We keep counties classified as Large Central Metro (`CODE2023 == 1`, urban core control) or Large Fringe Metro (`CODE2023 == 2`, suburban treatment), and further require that each county has all 15 annual observations in the window (balanced panel). The final analytic sample is **`r format(n_obs, big.mark = ",")`** county-year observations across **`r n_counties`** counties (`r n_suburban` suburban, `r n_urban` urban core). *Why:* The DiD design requires exactly two groups that are as comparable as possible. Including medium or small metro counties would blur the treated-vs-control contrast and make parallel trends harder to assess visually. The balanced-panel restriction ensures within-county comparisons are not confounded by unequal observation windows: a county present for only 8 of 15 years would have a structurally different growth trajectory even before applying any filter.
+
+3. **Dependent variable integrity.** The primary outcome is `annual_chg_pct` (year-over-year HPI growth rate), winsorized at the 1st and 99th percentiles to produce `chg_w`. Raw HPI levels are not the outcome because FHFA anchors each county's index to its own reference year --- a county with HPI = 250 is not more expensive than one with HPI = 120; it may simply have an older base year. Using growth rates eliminates this cross-county incomparability. We confirm there are no missing values of `annual_chg_pct` in the balanced panel; winsorization reduces the influence of the small number of counties with extreme reporting anomalies. For the regression check (Check 4), `log(HPI)` is used with county fixed effects, which similarly removes base-year differences by conditioning within counties. *Why:* Growth rates are the correct outcome for a DiD asking whether COVID-19 *accelerated* HPI appreciation in suburban counties relative to urban core counties; using levels would confound the treatment effect with pre-existing level differences driven entirely by when each county's index was initialized.
+
+4. **Treatment variables.** We construct three indicators: `suburban = 1` if `CODE2023 == 2`, else 0; `post_covid = 1` if `Year >= 2020`, else 0; `did_term = suburban x post_covid`. No observations are dropped in this step. *Why:* `did_term` is the key DiD interaction --- it equals 1 only for suburban counties in 2020--2024, the group-period cell where the remote-work demand shift should be visible if the hypothesis holds. Choosing 2020 as the break year follows the pandemic onset and the large-scale shift to remote work that began in spring 2020.
+
+---
+
+# Section 3: Analysis Plan
+
+1. **Research design.** Our question is causal: did the COVID-19-induced shift toward remote work *cause* housing prices to rise faster in suburban counties than in urban core counties? We cannot answer this by comparing HPI levels across county types at a single point in time, because suburban and urban core counties differ in many ways beyond proximity to city centers --- home size, lot size, income distribution, housing stock age --- that independently affect prices. The difference-in-differences design sidesteps this problem by comparing how HPI *growth rates change over time* in suburban counties versus urban core counties. If remote work had no effect, both groups should continue trending in parallel after 2020, just as they did before. If suburban counties attracted stronger demand because remote workers sought more space, their growth rates should accelerate relative to urban core starting in 2020. The key identifying assumption is **parallel trends**: in the absence of COVID-19, suburban and urban core HPI growth rates would have continued to evolve in parallel. We assess this assumption visually in Figure 3.
+
+2. **Key analyses.**
+
+*Analysis 1 (Figure 3): HPI growth rate trends over time --- the parallel-trends check.* For the analytic sample restricted to urban core and suburban counties, compute mean annual HPI growth rate (`chg_w`) for each group in each year from 2010 to 2024. Plot as a two-line chart --- one line per group --- with a dashed vertical line at 2020 and a horizontal reference at 0%. *Why:* This is the single most important figure. If the two lines track closely before 2020 and suburban growth pulls ahead after 2020, the figure simultaneously validates the parallel-trends assumption and displays the main finding. A reader who sees only Figure 3 should be able to assess whether the COVID-19 remote-work story is plausible before looking at any other output.
+
+```{r analysis-1, fig.cap = "Figure 3. Mean annual HPI growth rate (winsorized) by year for suburban and urban core counties, 2010-2024. The dashed line marks 2020. Pre-2020 growth rates track closely -- supporting the parallel-trends assumption."}
+df_clean %>%
+  filter(!is.na(chg_w)) %>%
+  group_by(Year, county_type) %>%
+  summarise(mean_growth = mean(chg_w, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(
+    x = Year,
+    y = mean_growth,
+    color = county_type,
+    group = county_type
+  )) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+  geom_vline(xintercept = 2020, linetype = "dashed", color = "grey40") +
+  annotate(
+    "text",
+    x = 2020.2,
+    y = Inf,
+    label = "COVID-19 (2020)",
+    hjust = 0,
+    vjust = 1.5,
+    size = 3.2,
+    color = "grey40"
+  ) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(labels = function(x) paste0(round(x, 1), "%")) +
+  scale_x_continuous(breaks = seq(2010, 2024, 2)) +
+  labs(
+    x = "Year",
+    y = "Mean Annual HPI Growth Rate (%)",
+    color = NULL,
+    title = "Figure 3: HPI Growth Rate Trends -- Suburban vs. Urban Core (2010-2024)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+*Analysis 2 (Figure 4): The 2x2 difference-in-differences.* Compute mean `chg_w` across the four group-period cells --- Urban Core Pre-COVID, Urban Core Post-COVID, Suburban Pre-COVID, Suburban Post-COVID --- and display as a grouped bar chart with numeric labels on each bar. Compute the DiD estimate: (Suburban Post - Suburban Pre) - (Urban Core Post - Urban Core Pre), in percentage points, and display it in the figure subtitle. *Why:* This distills Figure 3 into a single point estimate that directly answers the research question. A positive DiD means suburban counties experienced a larger acceleration in HPI growth post-2020 than urban core counties, above and beyond any common time trend --- which is the cleanest summary statistic a real estate investment firm can act on.
+
+```{r analysis-2, fig.cap = "Figure 4. Mean annual HPI growth rate in each of the four suburban x post-COVID cells. The DiD estimate (subtitle) is (Suburban Post - Suburban Pre) minus (Urban Core Post - Urban Core Pre), in percentage points. A positive estimate supports the remote-work demand-shift hypothesis."}
+cells <- df_clean %>%
+  filter(!is.na(chg_w)) %>%
+  group_by(suburban, post_covid) %>%
+  summarise(mean_chg = mean(chg_w, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    label = case_when(
+      suburban == 0 & post_covid == 0 ~ "Urban Core\nPre-COVID",
+      suburban == 0 & post_covid == 1 ~ "Urban Core\nPost-COVID",
+      suburban == 1 & post_covid == 0 ~ "Suburban\nPre-COVID",
+      suburban == 1 & post_covid == 1 ~ "Suburban\nPost-COVID"
+    ),
+    label = factor(
+      label,
+      levels = c(
+        "Urban Core\nPre-COVID",
+        "Urban Core\nPost-COVID",
+        "Suburban\nPre-COVID",
+        "Suburban\nPost-COVID"
+      )
+    ),
+    fill_group = ifelse(suburban == 1, "Suburban", "Urban Core")
+  )
+
+did_est <- cells %>%
+  pivot_wider(
+    id_cols = suburban,
+    names_from = post_covid,
+    values_from = mean_chg
+  ) %>%
+  mutate(diff = `1` - `0`) %>%
+  summarise(DiD = diff[suburban == 1] - diff[suburban == 0]) %>%
+  pull(DiD) %>%
+  round(2)
+
+ggplot(cells, aes(x = label, y = mean_chg, fill = fill_group)) +
+  geom_col(width = 0.6, show.legend = TRUE) +
+  geom_text(
+    aes(label = paste0(round(mean_chg, 1), "%")),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+  scale_fill_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(x, 1), "%"),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    x = NULL,
+    y = "Mean Annual HPI Growth Rate (%)",
+    fill = "County Type",
+    title = "Figure 4: 2x2 DiD -- Mean HPI Growth Rate by Group and Period",
+    subtitle = paste0(
+      "DiD estimate = ",
+      did_est,
+      " pct pts (suburban growth acceleration above urban core)"
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+*Analysis 3 (Figure 5): State-level suburban HPI growth premium post-COVID.* For each state containing both urban core and suburban counties in the analytic sample, compute the mean annual HPI growth rate (2020--2024) for each group and subtract to obtain the suburban premium. Display as a sorted horizontal bar chart, coloring bars by sign. *Why:* The DiD estimate in Figure 4 is a single pooled number. Figure 3 tests whether this average is consistent across geographies or driven by a handful of states --- a crucial diagnostic for a real estate investment firm deciding where to deploy capital. A broadly positive pattern across states strengthens confidence that the estimate reflects a national remote-work effect rather than a regional artifact; concentrated positive premiums in a few states would reframe the finding as a local market story.
+
+```{r analysis-3, fig.height = 7, fig.cap = "Figure 5. Within-state suburban HPI growth premium: mean annual growth rate (suburban) minus mean annual growth rate (urban core), post-COVID (2020-2024). Positive (blue) bars = suburban outperformed urban core within that state. Sorted from largest to smallest premium."}
+state_prem <- df_clean %>%
+  filter(post_covid == 1, !is.na(chg_w)) %>%
+  group_by(State, suburban) %>%
+  summarise(mean_g = mean(chg_w, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = suburban,
+    values_from = mean_g,
+    names_prefix = "s"
+  ) %>%
+  filter(!is.na(s0), !is.na(s1)) %>%
+  mutate(premium = s1 - s0, State = fct_reorder(State, premium))
+
+ggplot(state_prem, aes(x = premium, y = State, fill = premium > 0)) +
+  geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+  scale_fill_manual(values = c("firebrick", "steelblue")) +
+  scale_x_continuous(labels = function(x) paste0(round(x, 1), "%")) +
+  labs(
+    x = "Suburban minus Urban Core mean annual HPI growth (pct pts, 2020-2024)",
+    y = NULL,
+    title = "Figure 5: State-Level Suburban HPI Growth Premium Post-COVID"
+  ) +
+  theme_minimal(base_size = 10)
+```
+
+*Analysis 4 (Figure 6): HPI growth across the full urban-rural spectrum.* Using the full merged dataset (not restricted to codes 1--2), compute mean annual HPI growth rate by `CODE2023` separately for the pre-COVID (2010--2019) and post-COVID (2020--2024) periods. Display as a connected line chart, x-axis from Code 1 (most urban) to Code 6 (most rural). *Why:* This figure provides context for where the suburban effect sits within the full density gradient and tests whether post-COVID growth was uniquely concentrated at Code 2 (suburban) relative to Code 1 (urban core), or whether it was uniformly elevated everywhere. If growth rose across all density levels, a common macro factor --- such as the 2020--2021 low-interest-rate environment --- may explain much of the aggregate level shift, and the DiD in Figure 4 captures the incremental suburban premium net of that common trend.
+
+```{r analysis-4, fig.cap = "Figure 6. Mean annual HPI growth rate by all 6 CDC NCHS classification codes, pre-COVID (2010-2019) vs. post-COVID (2020-2024). Code 1 = most urban, Code 6 = most rural. Post-COVID growth rose across all density levels, consistent with a macro interest-rate effect. The DiD in Figure 4 isolates the suburban-urban differential above that common trend."}
+code_labels <- c(
+  "1" = "Large Central\nMetro",
+  "2" = "Large Fringe\nMetro",
+  "3" = "Medium\nMetro",
+  "4" = "Small\nMetro",
+  "5" = "Micro-\npolitan",
+  "6" = "Non-core"
+)
+
+df %>%
+  filter(Year >= 2010, Year <= 2024, !is.na(annual_chg_pct)) %>%
+  mutate(
+    period = ifelse(
+      Year >= 2020,
+      "Post-COVID (2020-2024)",
+      "Pre-COVID (2010-2019)"
+    ),
+    code = factor(CODE2023, levels = 1:6, labels = code_labels)
+  ) %>%
+  group_by(code, period) %>%
+  summarise(mean_g = mean(annual_chg_pct, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(code)) %>%
+  ggplot(aes(x = code, y = mean_g, color = period, group = period)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  scale_y_continuous(labels = function(x) paste0(round(x, 1), "%")) +
+  labs(
+    x = "CDC NCHS Urban-Rural Classification (1 = most urban, 6 = most rural)",
+    y = "Mean Annual HPI Growth Rate (%)",
+    color = NULL,
+    title = "Figure 6: HPI Growth Across the Full Urban-Rural Spectrum"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+3. **(Extra credit) Robustness checks.**
+
+*Check 1: Tighter pre-period window.* Re-run 3 restricting to 2015--2024 only. *Concern:* The 2010--2014 post-crisis recovery may have affected urban core and suburban markets at different speeds, creating the appearance of parallel pre-trends that would not hold in a more stable baseline window. If the two lines are even more parallel from 2015 onward, the identifying assumption is strengthened; if they diverge, the main result is suspect.
+
+*Check 2: Median vs. mean growth rate.* Re-run Figures 1 and 2 using county-level medians instead of means. *Concern:* A small number of high-growth outlier counties could pull the group means apart even if the typical county in each group saw similar patterns. If the median and mean tell different stories, the mean result is fragile and should be presented with the caveat that it is driven by a few extreme observations rather than the bulk of counties.
+
+*Check 3: 95% confidence intervals on the DiD estimate.* Add bootstrapped 95% confidence intervals to each cell mean in Figure 4. *Concern:* The DiD point estimate in Figure 4 does not convey how much uncertainty surrounds it. If the confidence intervals on the suburban and urban core cells overlap substantially, the gap could be a fluke of sampling noise rather than a stable signal.
+
+*Check 4 (extra, extra credit): Two-way fixed effects regression.* Estimate `log(HPI) ~ suburban:post_covid | fips + Year` using `fixest`, clustering standard errors at the county level. The coefficient on the interaction term is the within-county, within-year DiD estimate, stripped of county-level fixed differences and aggregate year shocks. *Concern:* The 2x2 visual DiD in Figure 4 does not control for county heterogeneity or year-level common shocks beyond the pre/post split; the two-way fixed effects model is the standard regression analogue that addresses both, and a significant positive coefficient there corroborates the visual evidence in Figure 4.
+
+```{r check-4}
+if (requireNamespace("fixest", quietly = TRUE)) {
+  library(fixest)
+  model_twfe <- fixest::feols(
+    log(HPI) ~ suburban:post_covid | fips + Year,
+    data = df_clean,
+    cluster = ~fips
+  )
+  fixest::etable(
+    model_twfe,
+    title = "Check 4: Two-Way Fixed Effects DiD (log HPI)"
+  )
+} else {
+  cat("Install fixest to run Check 4:  install.packages('fixest')\n")
+}
+```
